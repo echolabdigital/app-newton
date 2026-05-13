@@ -45,7 +45,6 @@ function cnpj_val(string $sql, array $p = []) {
 
 /**
  * Monta WHERE + params a partir dos filtros do formulário.
- * Retorna ['where' => '...', 'params' => [...]]
  */
 function cnpj_where(array $f): array {
     $conds  = [];
@@ -174,7 +173,42 @@ function cnpj_search(array $f, int $page = 1, int $per = 50): array {
     return compact('rows', 'total');
 }
 
-// ─── Constantes ────────────────────────────────────────────────────────
+// ─── Quota mensal ────────────────────────────────────────────
+
+/**
+ * Retorna quantos leads CNPJ o tenant já baixou no mês corrente.
+ * Usa o MySQL (banco principal) para garantir consistência transacional.
+ */
+function cnpj_quota_used(int $tenantId): int {
+    $month = date('Y-m');
+    return (int) db_val(
+        'SELECT COALESCE(SUM(rows_count), 0) FROM cnpj_download_log WHERE tenant_id = ? AND year_month = ?',
+        [$tenantId, $month]
+    );
+}
+
+/**
+ * Quanto resta do limite mensal do tenant.
+ */
+function cnpj_quota_remaining(int $tenantId, int $limit): int {
+    return max(0, $limit - cnpj_quota_used($tenantId));
+}
+
+/**
+ * Registra um download no log (upsert).
+ */
+function cnpj_quota_log(int $tenantId, int $rows): void {
+    if ($rows <= 0) return;
+    $month = date('Y-m');
+    db_q(
+        'INSERT INTO cnpj_download_log (tenant_id, year_month, rows_count)
+         VALUES (?, ?, ?)
+         ON DUPLICATE KEY UPDATE rows_count = rows_count + VALUES(rows_count)',
+        [$tenantId, $month, $rows]
+    );
+}
+
+// ─── Constantes ──────────────────────────────────────────────
 
 const CNPJ_SITUACOES = [
     'all' => 'Todas',

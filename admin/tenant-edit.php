@@ -3,7 +3,7 @@ require_once __DIR__ . '/../config.php';
 require_super_admin();
 require_once __DIR__ . '/_layout.php';
 
-$id = isset($_GET['id']) ? (int) $_GET['id'] : 0;
+$id     = isset($_GET['id']) ? (int) $_GET['id'] : 0;
 $is_new = !$id;
 
 if (!$is_new) {
@@ -14,13 +14,24 @@ if (!$is_new) {
         'slug'=>'', 'name'=>'', 'email'=>'', 'phone'=>'', 'document'=>'',
         'status'=>'pending', 'plan_id'=>null,
         'brand_name'=>'', 'brand_color'=>'#be123c', 'custom_domain'=>'',
-        'limit_dispatch_daily'=>200, 'limit_contacts'=>5000, 'limit_extractor_monthly'=>1000,
+        'limit_dispatch_daily'=>200, 'limit_contacts'=>5000,
+        'limit_extractor_monthly'=>1000, 'limit_cnpj_monthly'=>1000,
         'zapi_instance'=>null, 'zapi_phone'=>null, 'zapi_status'=>'disconnected',
         'notes'=>''
     ];
 }
 
 $plans = db_all("SELECT * FROM plans WHERE active=1 ORDER BY display_order");
+
+// Consumo de CNPJ no mês atual para este tenant
+$cnpj_used_this_month = 0;
+if (!$is_new) {
+    $month = date('Y-m');
+    $cnpj_used_this_month = (int) db_val(
+        'SELECT COALESCE(SUM(rows_count), 0) FROM cnpj_download_log WHERE tenant_id = ? AND year_month = ?',
+        [$id, $month]
+    );
+}
 
 // AÇÕES POST
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
@@ -40,18 +51,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'brand_name'    => trim($_POST['brand_name'] ?? '') ?: null,
                 'brand_color'   => $_POST['brand_color'] ?: '#be123c',
                 'custom_domain' => trim($_POST['custom_domain'] ?? '') ?: null,
-                'limit_dispatch_daily'    => (int) ($_POST['limit_dispatch_daily'] ?? 200),
-                'limit_contacts'          => (int) ($_POST['limit_contacts'] ?? 5000),
+                'limit_dispatch_daily'    => (int) ($_POST['limit_dispatch_daily']    ?? 200),
+                'limit_contacts'          => (int) ($_POST['limit_contacts']          ?? 5000),
                 'limit_extractor_monthly' => (int) ($_POST['limit_extractor_monthly'] ?? 1000),
+                'limit_cnpj_monthly'      => (int) ($_POST['limit_cnpj_monthly']      ?? 1000),
                 'notes'         => trim($_POST['notes'] ?? '') ?: null,
             ];
-            // Aplica limites do plano se mudou
+            // Aplica limites do plano se o plano mudou
             if ($data['plan_id']) {
                 $p = db_one("SELECT * FROM plans WHERE id = ?", [$data['plan_id']]);
                 if ($p && (!$id || (int)$tenant['plan_id'] !== (int)$data['plan_id'])) {
                     $data['limit_dispatch_daily']    = (int) $p['limit_dispatch_daily'];
                     $data['limit_contacts']          = (int) $p['limit_contacts'];
                     $data['limit_extractor_monthly'] = (int) $p['limit_extractor_monthly'];
+                    $data['limit_cnpj_monthly']      = (int) $p['limit_cnpj_monthly'];
                 }
             }
             if ($is_new) {
@@ -63,6 +76,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 audit_log('tenant.updated', 'tenant', $id);
                 flash_set('success', 'Tenant atualizado.');
             }
+            header('Location: tenant-edit.php?id=' . $id); exit;
+        }
+
+        if ($action === 'reset_cnpj_quota') {
+            $month = date('Y-m');
+            db_q('DELETE FROM cnpj_download_log WHERE tenant_id = ? AND year_month = ?', [$id, $month]);
+            audit_log('cnpj.quota_reset', 'tenant', $id, ['month' => $month]);
+            flash_set('success', 'Quota CNPJ do mês atual zerada.');
             header('Location: tenant-edit.php?id=' . $id); exit;
         }
 
@@ -94,13 +115,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $uid = (int) $existing['id'];
                 } else {
                     $uid = db_insert('users', [
-                        'email' => $email,
-                        'password_hash' => password_hash($pass, PASSWORD_DEFAULT),
-                        'name' => $name ?: null,
+                        'email'          => $email,
+                        'password_hash'  => password_hash($pass, PASSWORD_DEFAULT),
+                        'name'           => $name ?: null,
                         'is_super_admin' => 0,
                     ]);
                 }
-                // vincula
                 $exists = db_val("SELECT 1 FROM tenant_users WHERE tenant_id = ? AND user_id = ?", [$id, $uid]);
                 if (!$exists) {
                     db_insert('tenant_users', ['tenant_id' => $id, 'user_id' => $uid, 'role' => $role]);
@@ -123,7 +143,7 @@ $users = $is_new ? [] : db_all(
     [$id]
 );
 
-admin_layout(($is_new ? 'Novo Tenant' : 'Editar: ' . $tenant['name']), 'tenants', function() use ($tenant, $is_new, $id, $plans, $users) {
+admin_layout(($is_new ? 'Novo Tenant' : 'Editar: ' . $tenant['name']), 'tenants', function() use ($tenant, $is_new, $id, $plans, $users, $cnpj_used_this_month) {
 ?>
 
 <form method="POST">
@@ -182,19 +202,48 @@ admin_layout(($is_new ? 'Novo Tenant' : 'Editar: ' . $tenant['name']), 'tenants'
         </select>
       </div>
     </div>
+  </div>
+
+  <div class="panel">
+    <h2>Limites de uso</h2>
     <div class="row-3">
       <div class="field">
-        <label>Limite disparos/dia</label>
+        <label>Disparos/dia</label>
         <input type="number" name="limit_dispatch_daily" value="<?= (int)$tenant['limit_dispatch_daily'] ?>" min="0">
       </div>
       <div class="field">
-        <label>Limite contatos</label>
+        <label>Contatos</label>
         <input type="number" name="limit_contacts" value="<?= (int)$tenant['limit_contacts'] ?>" min="0">
       </div>
       <div class="field">
-        <label>Limite extrações/mês</label>
+        <label>Extrações Maps/mês</label>
         <input type="number" name="limit_extractor_monthly" value="<?= (int)$tenant['limit_extractor_monthly'] ?>" min="0">
       </div>
+    </div>
+    <div class="row-2">
+      <div class="field">
+        <label>Leads CNPJ/mês</label>
+        <input type="number" name="limit_cnpj_monthly" value="<?= (int)$tenant['limit_cnpj_monthly'] ?>" min="0">
+        <small style="font-size:.7rem;color:var(--ink-3);">Máx. de leads exportados via Newton CNPJ por mês</small>
+      </div>
+      <?php if (!$is_new): ?>
+      <div class="field">
+        <label>Consumo CNPJ — <?= date('m/Y') ?></label>
+        <?php
+          $lim = (int)$tenant['limit_cnpj_monthly'];
+          $pct = $lim > 0 ? min(100, round($cnpj_used_this_month / $lim * 100)) : 100;
+          $color = $pct >= 90 ? '#dc2626' : ($pct >= 70 ? '#d97706' : '#15803d');
+        ?>
+        <div style="display:flex;align-items:center;gap:.75rem;margin-top:.4rem;">
+          <div style="flex:1;background:var(--fog);border-radius:99px;height:10px;overflow:hidden;border:1px solid var(--border);">
+            <div style="width:<?= $pct ?>%;height:100%;background:<?= $color ?>;border-radius:99px;"></div>
+          </div>
+          <span style="font-size:.75rem;font-weight:700;color:<?= $color ?>;white-space:nowrap;">
+            <?= number_format($cnpj_used_this_month, 0, ',', '.') ?> / <?= number_format($lim, 0, ',', '.') ?>
+          </span>
+        </div>
+      </div>
+      <?php endif; ?>
     </div>
   </div>
 
@@ -230,6 +279,25 @@ admin_layout(($is_new ? 'Novo Tenant' : 'Editar: ' . $tenant['name']), 'tenants'
 </form>
 
 <?php if (!$is_new): ?>
+
+<!-- Quota CNPJ — ação administrativa -->
+<div class="panel">
+  <h2>Quota Newton CNPJ</h2>
+  <div style="display:flex;justify-content:space-between;align-items:center;gap:1rem;flex-wrap:wrap;">
+    <div>
+      <p style="font-size:.85rem;color:var(--ink-2);">
+        Baixados em <?= date('m/Y') ?>: <strong><?= number_format($cnpj_used_this_month, 0, ',', '.') ?></strong>
+        de <strong><?= number_format((int)$tenant['limit_cnpj_monthly'], 0, ',', '.') ?></strong> leads.
+      </p>
+      <p style="font-size:.75rem;color:var(--ink-3);margin-top:.3rem;">Zerar a quota credita os leads consumidos neste mês de volta ao tenant.</p>
+    </div>
+    <form method="POST" onsubmit="return confirm('Zerar quota CNPJ deste mês para este tenant?');">
+      <?= csrf_field() ?>
+      <input type="hidden" name="_action" value="reset_cnpj_quota">
+      <button type="submit" class="btn-action secondary">Zerar quota do mês</button>
+    </form>
+  </div>
+</div>
 
 <!-- Z-API -->
 <div class="panel">

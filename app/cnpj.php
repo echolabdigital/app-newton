@@ -37,6 +37,17 @@ if ($searched) {
     }
 }
 
+// Quota do tenant
+$tid            = tenant_id();
+$quota_limit    = (int) ($tenant['limit_cnpj_monthly'] ?? 1000);
+$quota_used     = 0;
+$quota_remaining = $quota_limit;
+try {
+    $quota_used      = cnpj_quota_used($tid);
+    $quota_remaining = max(0, $quota_limit - $quota_used);
+} catch (\Throwable $e) {}
+$quota_pct = $quota_limit > 0 ? min(100, round($quota_used / $quota_limit * 100)) : 100;
+
 $municipio_nome = '';
 if ($f['municipio'] && $f['uf']) {
     try {
@@ -76,7 +87,7 @@ function build_qs(array $overrides): string {
     return 'cnpj.php?' . http_build_query($merged);
 }
 
-app_layout('Newton CNPJ', 'cnpj', function() use ($f, $results, $error, $searched, $page, $per, $municipio_nome, $cnae_nome) {
+app_layout('Newton CNPJ', 'cnpj', function() use ($f, $results, $error, $searched, $page, $per, $municipio_nome, $cnae_nome, $quota_limit, $quota_used, $quota_remaining, $quota_pct) {
 ?>
 <style>
 .cnpj-wrap { display: grid; grid-template-columns: 290px 1fr; gap: 1.5rem; align-items: start; }
@@ -100,6 +111,10 @@ app_layout('Newton CNPJ', 'cnpj', function() use ($f, $results, $error, $searche
 .results-box { min-width: 0; }
 .top-bar { display: flex; align-items: center; gap: .75rem; margin-bottom: 1rem; flex-wrap: wrap; }
 .top-bar .count { font-size: .82rem; color: var(--ink-3); font-weight: 600; flex: 1; }
+.quota-bar-wrap { background: var(--white); border: 1px solid var(--border); border-radius: 12px; padding: 1rem 1.25rem; margin-bottom: 1.25rem; }
+.quota-bar-label { display: flex; justify-content: space-between; font-size: .75rem; font-weight: 700; margin-bottom: .5rem; }
+.quota-bar-track { height: 8px; background: var(--fog); border-radius: 99px; overflow: hidden; }
+.quota-bar-fill { height: 100%; border-radius: 99px; transition: width .4s; }
 .tbl { width: 100%; border-collapse: collapse; font-size: .77rem; }
 .tbl th { text-align: left; padding: .6rem .75rem; font-size: .68rem; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; color: var(--ink-3); border-bottom: 2px solid var(--border); white-space: nowrap; }
 .tbl td { padding: .6rem .75rem; border-bottom: 1px solid var(--border); vertical-align: middle; }
@@ -118,6 +133,28 @@ app_layout('Newton CNPJ', 'cnpj', function() use ($f, $results, $error, $searche
 .modal-bg { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.45); z-index: 1000; align-items: center; justify-content: center; }
 .modal-box { background: var(--white); border-radius: 16px; padding: 2rem; width: 420px; max-width: 92vw; }
 </style>
+
+<?php
+// Barra de quota mensal
+$bar_color = $quota_pct >= 90 ? '#dc2626' : ($quota_pct >= 70 ? '#d97706' : 'var(--cr)');
+?>
+<div class="quota-bar-wrap">
+  <div class="quota-bar-label">
+    <span>Leads baixados este mês</span>
+    <span style="color:<?= $bar_color ?>;">
+      <?= number_format($quota_used, 0, ',', '.') ?> de <?= number_format($quota_limit, 0, ',', '.') ?>
+      &nbsp;·&nbsp;
+      <?php if ($quota_remaining > 0): ?>
+        <strong><?= number_format($quota_remaining, 0, ',', '.') ?></strong> disponíveis
+      <?php else: ?>
+        <strong style="color:#dc2626;">Limite atingido</strong>
+      <?php endif; ?>
+    </span>
+  </div>
+  <div class="quota-bar-track">
+    <div class="quota-bar-fill" style="width:<?= $quota_pct ?>%;background:<?= $bar_color ?>;"></div>
+  </div>
+</div>
 
 <form method="get" action="cnpj.php" id="frm">
 <div class="cnpj-wrap">
@@ -260,9 +297,11 @@ app_layout('Newton CNPJ', 'cnpj', function() use ($f, $results, $error, $searche
             <strong><?= number_format($total, 0, ',', '.') ?></strong> empresa<?= $total !== 1 ? 's' : '' ?> — página <?= $page ?>
           <?php endif; ?>
         </span>
-        <?php if ($rows): ?>
-          <a href="cnpj-export.php?<?= $export_qs ?>" class="btn-action" target="_blank" style="font-size:.78rem;padding:.5rem 1rem;">⬇ CSV (5k)</a>
+        <?php if ($rows && $quota_remaining > 0): ?>
+          <a href="cnpj-export.php?<?= $export_qs ?>" class="btn-action" target="_blank" style="font-size:.78rem;padding:.5rem 1rem;">⬇ CSV (<?= number_format(min(5000, $quota_remaining), 0, ',', '.') ?> leads)</a>
           <button type="button" class="btn-action secondary" onclick="showModal()" style="font-size:.78rem;padding:.5rem 1rem;">📋 Salvar Lista</button>
+        <?php elseif ($rows && $quota_remaining <= 0): ?>
+          <span style="font-size:.78rem;color:#b91c1c;font-weight:700;">⚠ Limite mensal atingido</span>
         <?php endif; ?>
       </div>
 
@@ -376,7 +415,6 @@ function loadMunicipios(uf) {
     .catch(() => { sel.innerHTML = '<option value="">Erro ao carregar</option>'; });
 }
 
-// Restaura município ao carregar página se UF já está selecionada
 (function() {
   const uf  = document.getElementById('sel-uf').value;
   const mun = '<?= e($f['municipio']) ?>';

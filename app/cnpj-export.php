@@ -3,6 +3,18 @@ require_once __DIR__ . '/../config.php';
 $tenant = require_tenant();
 require_once __DIR__ . '/../core/cnpj_db.php';
 
+$tid   = tenant_id();
+$limit = (int) ($tenant['limit_cnpj_monthly'] ?? 1000);
+
+// ── Verificar quota ANTES de qualquer output ────────────────
+$remaining = cnpj_quota_remaining($tid, $limit);
+if ($remaining <= 0) {
+    flash_set('error', 'Limite mensal de downloads CNPJ atingido. Aguarde o próximo mês ou solicite aumento de limite.');
+    header('Location: cnpj.php');
+    exit;
+}
+
+// ── Filtros ──────────────────────────────────────────────────
 $f = [
     'q'           => trim($_GET['q']            ?? ''),
     'situacao'    => $_GET['situacao']           ?? '02',
@@ -29,6 +41,21 @@ $joins = "
     LEFT JOIN rf_simples sim    ON sim.cnpj_basico = est.cnpj_basico
 ";
 
+// Conta resultados reais para saber exatamente o que será baixado
+$available   = (int) cnpj_val("SELECT COUNT(*) $joins $where", $params);
+$cap         = min(5000, $remaining, $available); // nunca excede quota nem 5k por vez
+
+if ($cap <= 0) {
+    flash_set('error', 'Nenhum resultado para exportar com os filtros atuais.');
+    header('Location: cnpj.php?' . http_build_query(array_filter($f)));
+    exit;
+}
+
+// Reserva quota ANTES de fazer streaming (evita duplo download em race condition)
+cnpj_quota_log($tid, $cap);
+audit_log('cnpj.export', 'tenant', $tid, ['rows' => $cap, 'filters' => $f]);
+
+// ── Streaming CSV ────────────────────────────────────────────
 $stmt = cnpj_q("
     SELECT
         est.cnpj_basico || est.cnpj_ordem || est.cnpj_dv AS cnpj,
@@ -51,8 +78,8 @@ $stmt = cnpj_q("
     $joins
     $where
     ORDER BY emp.razao_social
-    LIMIT 5000
-", $params);
+    LIMIT ?
+", array_merge($params, [$cap]));
 
 $filename = 'newton-cnpj-' . date('Y-m-d-His') . '.csv';
 header('Content-Type: text/csv; charset=UTF-8');
