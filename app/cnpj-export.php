@@ -1,120 +1,112 @@
 <?php
-require_once __DIR__ . '/../config.php';
-$tenant = require_tenant();
+/**
+ * Newton AI — CNPJ Export (quota v2)
+ * Exporta leads como CSV respeitando limite mensal + addon credits.
+ */
+
+require_once __DIR__ . '/../core/auth.php';
+require_once __DIR__ . '/../core/db.php';
 require_once __DIR__ . '/../core/cnpj_db.php';
 
-$tid   = tenant_id();
-$limit = (int) ($tenant['limit_cnpj_monthly'] ?? 1000);
+$limit = cnpj_monthly_limit($tenant_id);
+$used  = cnpj_monthly_used($tenant_id);
+$pct   = cnpj_usage_pct($used, $limit);
 
-// ── Verificar quota ANTES de qualquer output ────────────────
-$remaining = cnpj_quota_remaining($tid, $limit);
-if ($remaining <= 0) {
-    flash_set('error', 'Limite mensal de downloads CNPJ atingido. Aguarde o próximo mês ou solicite aumento de limite.');
-    header('Location: cnpj.php');
+// Block at 100 %
+if ($pct >= 100) {
+    header('Content-Type: application/json');
+    http_response_code(403);
+    echo json_encode([
+        'error'   => 'limit_reached',
+        'message' => "Você atingiu 100% do seu limite mensal ({$limit} leads). "
+                   . 'Adquira um pacote adicional ou aguarde a renovação no próximo mês.',
+        'used'    => $used,
+        'limit'   => $limit,
+        'percent' => $pct,
+    ]);
     exit;
 }
 
-// ── Filtros ──────────────────────────────────────────────────
-$f = [
-    'q'           => trim($_GET['q']            ?? ''),
-    'situacao'    => $_GET['situacao']           ?? '02',
-    'uf'          => strtoupper(trim($_GET['uf'] ?? '')),
-    'municipio'   => trim($_GET['municipio']    ?? ''),
-    'cnae'        => trim($_GET['cnae']         ?? ''),
-    'porte'       => $_GET['porte']              ?? '',
-    'mf'          => $_GET['mf']                 ?? '',
-    'simples'     => !empty($_GET['simples']),
-    'mei'         => !empty($_GET['mei']),
-    'tem_email'   => !empty($_GET['tem_email']),
-    'tem_tel'     => !empty($_GET['tem_tel']),
-    'abertura_de' => $_GET['abertura_de']        ?? '',
-    'abertura_ate'=> $_GET['abertura_ate']       ?? '',
-];
+// Build query
+$filters = $_GET;
+[$where, $params] = cnpj_build_where($filters);
 
-['where' => $where, 'params' => $params] = cnpj_where($f);
+$total = (int) cnpj_val(
+    "SELECT COUNT(*) FROM rf_estabelecimentos e
+     JOIN rf_empresas emp ON emp.cnpj_basico = e.cnpj_basico $where",
+    $params
+);
 
-$joins = "
-    FROM rf_estabelecimentos est
-    JOIN rf_empresas emp ON emp.cnpj_basico = est.cnpj_basico
-    LEFT JOIN rf_cnaes cn      ON cn.codigo  = est.cnae_principal
-    LEFT JOIN rf_municipios mun ON mun.codigo = est.municipio
-    LEFT JOIN rf_simples sim    ON sim.cnpj_basico = est.cnpj_basico
-";
+$available    = $limit - $used;
+$max_per_dl   = 5000;
+$export_count = min($total, $max_per_dl, $available);
 
-// Conta resultados reais para saber exatamente o que será baixado
-$available   = (int) cnpj_val("SELECT COUNT(*) $joins $where", $params);
-$cap         = min(5000, $remaining, $available); // nunca excede quota nem 5k por vez
-
-if ($cap <= 0) {
-    flash_set('error', 'Nenhum resultado para exportar com os filtros atuais.');
-    header('Location: cnpj.php?' . http_build_query(array_filter($f)));
+if ($export_count <= 0) {
+    header('Content-Type: application/json');
+    http_response_code(403);
+    echo json_encode([
+        'error'   => 'limit_reached',
+        'message' => "Limite insuficiente. Disponível: {$available} leads este mês.",
+        'used'    => $used,
+        'limit'   => $limit,
+        'percent' => $pct,
+    ]);
     exit;
 }
 
-// Reserva quota ANTES de fazer streaming (evita duplo download em race condition)
-cnpj_quota_log($tid, $cap);
-audit_log('cnpj.export', 'tenant', $tid, ['rows' => $cap, 'filters' => $f]);
+// Log BEFORE streaming (reserve quota)
+cnpj_quota_log($tenant_id, $export_count, $filters);
 
-// ── Streaming CSV ────────────────────────────────────────────
-$stmt = cnpj_q("
-    SELECT
-        est.cnpj_basico || est.cnpj_ordem || est.cnpj_dv AS cnpj,
+// Alert header (non-blocking)
+$alert = cnpj_alert_message($pct, $used, $limit);
+
+$rows = cnpj_all(
+    "SELECT
+        e.cnpj_basico || e.cnpj_ordem || e.cnpj_dv AS cnpj,
         emp.razao_social,
-        est.nome_fantasia,
-        est.situacao_cadastral,
-        est.data_inicio_atividade::text AS data_abertura,
-        est.cnae_principal,
-        COALESCE(cn.descricao, '') AS cnae_desc,
+        e.nome_fantasia,
+        e.situacao_cadastral,
+        e.data_situacao_cadastral,
+        e.cnae_fiscal_principal,
+        e.tipo_logradouro || ' ' || e.logradouro AS endereco,
+        e.numero,
+        e.complemento,
+        e.bairro,
+        e.municipio,
+        e.uf,
+        e.cep,
+        e.ddd1,
+        e.telefone1,
+        e.ddd2,
+        e.telefone2,
+        e.correio_eletronico,
         emp.porte_empresa,
-        est.identificador_mf,
-        est.uf,
-        COALESCE(mun.descricao, '') AS municipio,
-        est.bairro,
-        est.cep,
-        est.ddd1 || est.telefone1 AS telefone,
-        est.ddd2 || est.telefone2 AS telefone2,
-        est.email,
-        emp.capital_social::text AS capital_social
-    $joins
-    $where
-    ORDER BY emp.razao_social
-    LIMIT ?
-", array_merge($params, [$cap]));
+        emp.capital_social
+     FROM rf_estabelecimentos e
+     JOIN rf_empresas emp ON emp.cnpj_basico = e.cnpj_basico
+     $where
+     LIMIT $export_count",
+    $params
+);
 
-$filename = 'newton-cnpj-' . date('Y-m-d-His') . '.csv';
-header('Content-Type: text/csv; charset=UTF-8');
-header('Content-Disposition: attachment; filename="' . $filename . '"');
-header('Cache-Control: no-cache');
-
-echo "\xEF\xBB\xBF"; // BOM UTF-8 para Excel
+header('Content-Type: text/csv; charset=utf-8');
+header('Content-Disposition: attachment; filename="cnpj_export_' . date('Y-m-d_His') . '.csv"');
+if ($alert) {
+    header('X-Newton-Alert: ' . $alert);
+}
 
 $out = fopen('php://output', 'w');
+fwrite($out, "\xEF\xBB\xBF"); // BOM for Excel
+
 fputcsv($out, [
-    'CNPJ', 'Razão Social', 'Nome Fantasia', 'Situação',
-    'Data Abertura', 'CNAE', 'Setor (CNAE)', 'Porte', 'Tipo',
-    'UF', 'Município', 'Bairro', 'CEP',
-    'Telefone 1', 'Telefone 2', 'E-mail', 'Capital Social (R$)',
+    'CNPJ','Razão Social','Nome Fantasia','Situação','Dt.Situação',
+    'CNAE Principal','Endereço','Número','Complemento',
+    'Bairro','Município','UF','CEP','DDD1','Telefone1','DDD2','Telefone2',
+    'E-mail','Porte','Capital Social',
 ], ';');
 
-while ($r = $stmt->fetch(PDO::FETCH_ASSOC)) {
-    fputcsv($out, [
-        cnpj_fmt($r['cnpj']),
-        $r['razao_social'],
-        $r['nome_fantasia'],
-        cnpj_situacao_label($r['situacao_cadastral']),
-        $r['data_abertura'],
-        $r['cnae_principal'],
-        $r['cnae_desc'],
-        cnpj_porte_label($r['porte_empresa']),
-        $r['identificador_mf'] === '1' ? 'Matriz' : 'Filial',
-        $r['uf'],
-        $r['municipio'],
-        $r['bairro'],
-        $r['cep'],
-        $r['telefone'],
-        $r['telefone2'],
-        $r['email'],
-        $r['capital_social'],
-    ], ';');
+foreach ($rows as $r) {
+    fputcsv($out, array_values($r), ';');
 }
 fclose($out);
+exit;

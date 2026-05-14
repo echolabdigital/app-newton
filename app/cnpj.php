@@ -1,451 +1,322 @@
 <?php
-require_once __DIR__ . '/../config.php';
-$tenant = require_tenant();
+/**
+ * Newton AI — Newton CNPJ: busca e prospecção de empresas
+ */
+
+require_once __DIR__ . '/../core/auth.php';
+require_once __DIR__ . '/../core/db.php';
 require_once __DIR__ . '/../core/cnpj_db.php';
-require_once __DIR__ . '/_layout.php';
 
-$f = [
-    'q'           => trim($_GET['q']            ?? ''),
-    'situacao'    => $_GET['situacao']           ?? '02',
-    'uf'          => strtoupper(trim($_GET['uf'] ?? '')),
-    'municipio'   => trim($_GET['municipio']    ?? ''),
-    'cnae'        => trim($_GET['cnae']         ?? ''),
-    'porte'       => $_GET['porte']              ?? '',
-    'mf'          => $_GET['mf']                 ?? '',
-    'simples'     => !empty($_GET['simples']),
-    'mei'         => !empty($_GET['mei']),
-    'tem_email'   => !empty($_GET['tem_email']),
-    'tem_tel'     => !empty($_GET['tem_tel']),
-    'abertura_de' => $_GET['abertura_de']        ?? '',
-    'abertura_ate'=> $_GET['abertura_ate']       ?? '',
-];
+$f = array_map('trim', array_filter($_GET, 'is_string'));
 
-$page     = max(1, (int) ($_GET['page'] ?? 1));
-$per      = 50;
-$results  = null;
-$error    = null;
-$searched = array_key_exists('q', $_GET)
-         || array_key_exists('uf', $_GET)
-         || array_key_exists('cnae', $_GET);
+$page    = max(1, (int) ($_GET['page'] ?? 1));
+$per     = 20;
+$results = ['rows' => [], 'total' => 0];
 
-if ($searched) {
-    try {
-        $results = cnpj_search($f, $page, $per);
-    } catch (\Throwable $e) {
-        $error = 'Não foi possível conectar na base CNPJ. '
-               . 'Configure as constantes CNPJ_DB_* no config.php.';
-    }
+if (!empty($f)) {
+    $results = cnpj_search($f, $page, $per);
 }
 
-// Quota do tenant
-$tid            = tenant_id();
-$quota_limit    = (int) ($tenant['limit_cnpj_monthly'] ?? 1000);
-$quota_used     = 0;
-$quota_remaining = $quota_limit;
-try {
-    $quota_used      = cnpj_quota_used($tid);
-    $quota_remaining = max(0, $quota_limit - $quota_used);
-} catch (\Throwable $e) {}
-$quota_pct = $quota_limit > 0 ? min(100, round($quota_used / $quota_limit * 100)) : 100;
+$total_pages = min(200, (int) ceil($results['total'] / $per));
 
-$municipio_nome = '';
-if ($f['municipio'] && $f['uf']) {
-    try {
-        $m = cnpj_one('SELECT descricao FROM rf_municipios WHERE codigo = ?', [$f['municipio']]);
-        $municipio_nome = $m['descricao'] ?? '';
-    } catch (\Throwable $e) {}
-}
+// Quota info
+$q_limit = cnpj_monthly_limit($tenant_id);
+$q_used  = cnpj_monthly_used($tenant_id);
+$q_pct   = cnpj_usage_pct($q_used, $q_limit);
+$q_addon = (int) db_val(
+    'SELECT cnpj_addon_credits FROM tenants WHERE id = ?',
+    [$tenant_id]
+);
+$q_bar_class = $q_pct >= 90 ? 'danger' : ($q_pct >= 50 ? 'warn' : 'ok');
 
-$cnae_nome = '';
-if ($f['cnae']) {
-    try {
-        $code = str_pad(preg_replace('/\D/', '', $f['cnae']), 7, '0', STR_PAD_LEFT);
-        $c    = cnpj_one('SELECT descricao FROM rf_cnaes WHERE codigo = ?', [$code]);
-        $cnae_nome = $c['descricao'] ?? '';
-    } catch (\Throwable $e) {}
-}
-
-function build_qs(array $overrides): string {
-    global $f, $page;
-    $base = [
-        'q'           => $f['q'],
-        'situacao'    => $f['situacao'],
-        'uf'          => $f['uf'],
-        'municipio'   => $f['municipio'],
-        'cnae'        => $f['cnae'],
-        'porte'       => $f['porte'],
-        'mf'          => $f['mf'],
-        'simples'     => $f['simples']   ? '1' : '',
-        'mei'         => $f['mei']       ? '1' : '',
-        'tem_email'   => $f['tem_email'] ? '1' : '',
-        'tem_tel'     => $f['tem_tel']   ? '1' : '',
-        'abertura_de' => $f['abertura_de'],
-        'abertura_ate'=> $f['abertura_ate'],
-        'page'        => (string) $page,
-    ];
-    $merged = array_filter(array_merge($base, $overrides), fn($v) => $v !== '' && $v !== null);
-    return 'cnpj.php?' . http_build_query($merged);
-}
-
-app_layout('Newton CNPJ', 'cnpj', function() use ($f, $results, $error, $searched, $page, $per, $municipio_nome, $cnae_nome, $quota_limit, $quota_used, $quota_remaining, $quota_pct) {
-?>
+app_layout('Newton CNPJ', 'cnpj', function () use ($f, $results, $page, $total_pages, $q_limit, $q_used, $q_pct, $q_addon, $q_bar_class) {
+?><!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Newton CNPJ</title>
 <style>
-.cnpj-wrap { display: grid; grid-template-columns: 290px 1fr; gap: 1.5rem; align-items: start; }
-.filter-box { background: var(--white); border: 1px solid var(--border); border-radius: 16px; padding: 1.25rem; position: sticky; top: 0; }
-.filter-box h3 { font-size: .7rem; font-weight: 800; text-transform: uppercase; letter-spacing: .06em; color: var(--ink-3); margin-bottom: 1rem; }
-.fg { margin-bottom: .85rem; }
-.fg label { display: block; font-size: .72rem; font-weight: 700; color: var(--ink-2); margin-bottom: .3rem; }
-.fg input, .fg select {
-    width: 100%; padding: .5rem .7rem;
-    border: 1px solid var(--border); border-radius: 8px;
-    font-family: inherit; font-size: .8rem; color: var(--ink);
-    background: var(--fog); outline: none; transition: border-color .15s;
-}
-.fg input:focus, .fg select:focus { border-color: var(--cr); background: var(--white); }
-.fg .hint { font-size: .68rem; color: var(--cr); margin-top: .25rem; font-weight: 600; }
-.chk { display: flex; align-items: center; gap: .45rem; font-size: .78rem; font-weight: 600; color: var(--ink-2); cursor: pointer; margin-bottom: .45rem; }
-.chk input { width: 15px; height: 15px; accent-color: var(--cr); flex-shrink: 0; }
-.sep { height: 1px; background: var(--border); margin: .9rem 0; }
-.btn-search { width: 100%; padding: .65rem; background: var(--cr); color: #fff; border: none; border-radius: 10px; font-family: inherit; font-size: .85rem; font-weight: 700; cursor: pointer; transition: opacity .15s; }
-.btn-search:hover { opacity: .88; }
-.results-box { min-width: 0; }
-.top-bar { display: flex; align-items: center; gap: .75rem; margin-bottom: 1rem; flex-wrap: wrap; }
-.top-bar .count { font-size: .82rem; color: var(--ink-3); font-weight: 600; flex: 1; }
-.quota-bar-wrap { background: var(--white); border: 1px solid var(--border); border-radius: 12px; padding: 1rem 1.25rem; margin-bottom: 1.25rem; }
-.quota-bar-label { display: flex; justify-content: space-between; font-size: .75rem; font-weight: 700; margin-bottom: .5rem; }
-.quota-bar-track { height: 8px; background: var(--fog); border-radius: 99px; overflow: hidden; }
-.quota-bar-fill { height: 100%; border-radius: 99px; transition: width .4s; }
-.tbl { width: 100%; border-collapse: collapse; font-size: .77rem; }
-.tbl th { text-align: left; padding: .6rem .75rem; font-size: .68rem; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; color: var(--ink-3); border-bottom: 2px solid var(--border); white-space: nowrap; }
-.tbl td { padding: .6rem .75rem; border-bottom: 1px solid var(--border); vertical-align: middle; }
-.tbl tr:hover td { background: var(--fog); }
-.cnpj-num { font-family: monospace; font-size: .78rem; color: var(--ink-2); white-space: nowrap; }
-.tc { max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.badge { display: inline-block; padding: 2px 8px; border-radius: 20px; font-size: .65rem; font-weight: 700; }
-.b-ativa   { background: #dcfce7; color: #15803d; }
-.b-baixada { background: #fee2e2; color: #b91c1c; }
-.b-outros  { background: #fef9c3; color: #854d0e; }
-.pager { display: flex; gap: .4rem; justify-content: center; margin-top: 1.25rem; flex-wrap: wrap; }
-.pbtn { padding: .38rem .7rem; border: 1px solid var(--border); border-radius: 7px; background: var(--white); color: var(--ink-2); font-size: .75rem; font-weight: 600; text-decoration: none; }
-.pbtn:hover { background: var(--fog); }
-.pbtn.cur { background: var(--cr); color: #fff; border-color: var(--cr); }
-.empty-box { text-align: center; padding: 3rem; color: var(--ink-3); }
-.modal-bg { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.45); z-index: 1000; align-items: center; justify-content: center; }
-.modal-box { background: var(--white); border-radius: 16px; padding: 2rem; width: 420px; max-width: 92vw; }
+  .cnpj-wrap        { display:flex; gap:20px; align-items:flex-start; }
+  .cnpj-filters     { width:240px; flex-shrink:0; background:#fff; border-radius:12px; padding:20px; box-shadow:0 1px 4px rgba(0,0,0,.08); }
+  .cnpj-results     { flex:1; min-width:0; }
+  .filter-group     { margin-bottom:14px; }
+  .filter-group label  { display:block; font-size:.78rem; font-weight:600; color:#6b7280; margin-bottom:4px; }
+  .filter-group input,
+  .filter-group select { width:100%; box-sizing:border-box; padding:7px 10px; border:1px solid #e5e7eb; border-radius:8px; font-size:.85rem; }
+  .btn-primary      { background:var(--cr,#6366f1); color:#fff; border:none; border-radius:8px; padding:9px 18px; cursor:pointer; font-size:.9rem; width:100%; }
+  .quota-bar-wrap   { background:#e5e7eb; border-radius:6px; height:10px; margin-top:6px; }
+  .quota-bar        { height:10px; border-radius:6px; transition:width .4s; background:#22c55e; }
+  .quota-bar.warn   { background:#f59e0b; }
+  .quota-bar.danger { background:#ef4444; }
+  .quota-info       { background:#fff; border-radius:12px; padding:14px 18px; margin-bottom:16px; box-shadow:0 1px 4px rgba(0,0,0,.08); }
+  .quota-info small { color:#6b7280; font-size:.8rem; }
+  .results-card     { background:#fff; border-radius:12px; overflow:hidden; box-shadow:0 1px 4px rgba(0,0,0,.08); }
+  .results-table    { width:100%; border-collapse:collapse; font-size:.85rem; }
+  .results-table th { background:#f9fafb; font-weight:600; padding:10px 12px; text-align:left; border-bottom:1px solid #e5e7eb; }
+  .results-table td { padding:10px 12px; border-bottom:1px solid #f3f4f6; vertical-align:top; }
+  .results-table tr:last-child td { border-bottom:none; }
+  .badge            { display:inline-block; padding:2px 8px; border-radius:999px; font-size:.72rem; font-weight:600; }
+  .badge-green      { background:#d1fae5; color:#065f46; }
+  .badge-red        { background:#fee2e2; color:#991b1b; }
+  .badge-gray       { background:#f3f4f6; color:#374151; }
+  .pagination       { display:flex; gap:6px; align-items:center; padding:14px 18px; flex-wrap:wrap; }
+  .pagination a,
+  .pagination span  { padding:6px 12px; border-radius:6px; font-size:.85rem; text-decoration:none; border:1px solid #e5e7eb; }
+  .pagination a     { color:var(--cr,#6366f1); }
+  .pagination span.current { background:var(--cr,#6366f1); color:#fff; border-color:var(--cr,#6366f1); }
+  .export-btn       { display:inline-flex; align-items:center; gap:6px; background:#22c55e; color:#fff; border:none; border-radius:8px; padding:8px 16px; font-size:.85rem; cursor:pointer; text-decoration:none; }
+  .export-btn:hover { background:#16a34a; }
+  .empty-state      { padding:60px 20px; text-align:center; color:#9ca3af; }
+  .modal-bg         { display:none; position:fixed; inset:0; background:rgba(0,0,0,.4); z-index:100; align-items:center; justify-content:center; }
+  .modal-bg.open    { display:flex; }
+  .modal            { background:#fff; border-radius:14px; padding:28px; max-width:420px; width:90%; box-shadow:0 10px 40px rgba(0,0,0,.2); }
+  .modal h3         { margin:0 0 16px; }
+  .modal input, .modal textarea { width:100%; box-sizing:border-box; padding:8px 12px; border:1px solid #e5e7eb; border-radius:8px; font-size:.9rem; margin-bottom:10px; }
+  .modal-actions    { display:flex; gap:10px; justify-content:flex-end; margin-top:6px; }
+  .btn-cancel       { background:#f3f4f6; color:#374151; border:none; border-radius:8px; padding:8px 16px; cursor:pointer; }
 </style>
+</head>
+<body>
 
-<?php
-// Barra de quota mensal
-$bar_color = $quota_pct >= 90 ? '#dc2626' : ($quota_pct >= 70 ? '#d97706' : 'var(--cr)');
-?>
-<div class="quota-bar-wrap">
-  <div class="quota-bar-label">
-    <span>Leads baixados este mês</span>
-    <span style="color:<?= $bar_color ?>;">
-      <?= number_format($quota_used, 0, ',', '.') ?> de <?= number_format($quota_limit, 0, ',', '.') ?>
-      &nbsp;·&nbsp;
-      <?php if ($quota_remaining > 0): ?>
-        <strong><?= number_format($quota_remaining, 0, ',', '.') ?></strong> disponíveis
-      <?php else: ?>
-        <strong style="color:#dc2626;">Limite atingido</strong>
-      <?php endif; ?>
-    </span>
+<!-- Quota bar -->
+<div class="quota-info">
+  <div style="display:flex;justify-content:space-between;align-items:center">
+    <div>
+      <strong>Newton CNPJ</strong> &nbsp;
+      <small>Leads este mês: <?= number_format($q_used) ?> / <?= number_format($q_limit) ?>
+        <?php if ($q_addon > 0): ?> &nbsp;|&nbsp; <?= number_format($q_addon) ?> créditos extras<?php endif; ?>
+      </small>
+    </div>
+    <a href="cnpj-lists.php" style="font-size:.82rem;color:var(--cr,#6366f1)">Minhas listas ›</a>
   </div>
-  <div class="quota-bar-track">
-    <div class="quota-bar-fill" style="width:<?= $quota_pct ?>%;background:<?= $bar_color ?>;"></div>
+  <div class="quota-bar-wrap">
+    <div class="quota-bar <?= $q_bar_class ?>" style="width:<?= $q_pct ?>%"></div>
   </div>
 </div>
 
-<form method="get" action="cnpj.php" id="frm">
+<form method="get" id="cnpj-form">
 <div class="cnpj-wrap">
 
-  <!-- FILTROS -->
-  <aside class="filter-box">
-    <h3>Filtros de Prospecção</h3>
-
-    <div class="fg">
+  <!-- Filters -->
+  <aside class="cnpj-filters">
+    <div class="filter-group">
       <label>CNPJ ou Razão Social</label>
-      <input type="text" name="q" value="<?= e($f['q']) ?>" placeholder="12.345.678/0001-00 ou nome" autocomplete="off">
+      <input type="text" name="q" value="<?= e($f['q'] ?? '') ?>" placeholder="Ex: 12.345.678 ou Empresa XPTO">
     </div>
-
-    <div class="sep"></div>
-
-    <div class="fg">
-      <label>Estado (UF)</label>
-      <select name="uf" id="sel-uf" onchange="loadMunicipios(this.value)">
-        <option value="">Todos os estados</option>
-        <?php foreach (CNPJ_UFS as $uf): ?>
-          <option value="<?= $uf ?>" <?= $f['uf']===$uf?'selected':'' ?>><?= $uf ?></option>
+    <div class="filter-group">
+      <label>Situação</label>
+      <select name="situacao">
+        <option value="">Todas</option>
+        <?php foreach (CNPJ_SITUACOES as $k => $v): ?>
+        <option value="<?= $k ?>" <?= ($f['situacao'] ?? '') === $k ? 'selected' : '' ?>><?= $v ?></option>
         <?php endforeach; ?>
       </select>
     </div>
-
-    <div class="fg">
-      <label>Município</label>
-      <select name="municipio" id="sel-mun">
+    <div class="filter-group">
+      <label>UF</label>
+      <select name="uf" id="uf-sel" onchange="loadMunicipios()">
         <option value="">Todos</option>
-        <?php if ($f['municipio'] && $municipio_nome): ?>
-          <option value="<?= e($f['municipio']) ?>" selected><?= e($municipio_nome) ?></option>
+        <?php foreach (CNPJ_UFS as $uf): ?>
+        <option value="<?= $uf ?>" <?= ($f['uf'] ?? '') === $uf ? 'selected' : '' ?>><?= $uf ?></option>
+        <?php endforeach; ?>
+      </select>
+    </div>
+    <div class="filter-group">
+      <label>Município</label>
+      <select name="municipio" id="mun-sel">
+        <option value="">Todos</option>
+        <?php if (!empty($f['municipio'])): ?>
+        <option value="<?= e($f['municipio']) ?>" selected><?= e($f['municipio']) ?></option>
         <?php endif; ?>
       </select>
     </div>
-
-    <div class="fg">
-      <label>CNAE (código ou início)</label>
-      <input type="text" name="cnae" value="<?= e($f['cnae']) ?>" placeholder="4711, 47, 8599…">
-      <?php if ($cnae_nome): ?>
-        <div class="hint"><?= e(mb_substr($cnae_nome, 0, 50)) ?></div>
-      <?php endif; ?>
+    <div class="filter-group">
+      <label>CNAE principal</label>
+      <input type="text" name="cnae" value="<?= e($f['cnae'] ?? '') ?>" placeholder="Ex: 6201500">
     </div>
-
-    <div class="fg">
+    <div class="filter-group">
       <label>Porte</label>
       <select name="porte">
+        <option value="">Todos</option>
         <?php foreach (CNPJ_PORTES as $k => $v): ?>
-          <option value="<?= $k ?>" <?= $f['porte']===$k?'selected':'' ?>><?= e($v) ?></option>
+        <option value="<?= $k ?>" <?= ($f['porte'] ?? '') === $k ? 'selected' : '' ?>><?= $v ?></option>
         <?php endforeach; ?>
       </select>
     </div>
-
-    <div class="fg">
-      <label>Situação cadastral</label>
-      <select name="situacao">
-        <?php foreach (CNPJ_SITUACOES as $k => $v): ?>
-          <option value="<?= $k ?>" <?= $f['situacao']===$k?'selected':'' ?>><?= e($v) ?></option>
-        <?php endforeach; ?>
-      </select>
-    </div>
-
-    <div class="fg">
-      <label>Tipo</label>
+    <div class="filter-group">
+      <label>Matriz / Filial</label>
       <select name="mf">
-        <option value="">Matriz + Filial</option>
-        <option value="1" <?= $f['mf']==='1'?'selected':'' ?>>Apenas Matriz</option>
-        <option value="2" <?= $f['mf']==='2'?'selected':'' ?>>Apenas Filial</option>
+        <option value="">Ambos</option>
+        <option value="1" <?= ($f['mf'] ?? '') === '1' ? 'selected' : '' ?>>Matriz</option>
+        <option value="2" <?= ($f['mf'] ?? '') === '2' ? 'selected' : '' ?>>Filial</option>
       </select>
     </div>
-
-    <div class="fg">
-      <label>Abertura — de</label>
-      <input type="date" name="abertura_de"  value="<?= e($f['abertura_de']) ?>">
+    <div class="filter-group">
+      <label>Abertura de</label>
+      <input type="date" name="abertura_de" value="<?= e($f['abertura_de'] ?? '') ?>">
     </div>
-    <div class="fg">
-      <label>Abertura — até</label>
-      <input type="date" name="abertura_ate" value="<?= e($f['abertura_ate']) ?>">
+    <div class="filter-group">
+      <label>Abertura até</label>
+      <input type="date" name="abertura_ate" value="<?= e($f['abertura_ate'] ?? '') ?>">
     </div>
-
-    <div class="sep"></div>
-
-    <label class="chk"><input type="checkbox" name="tem_email" value="1" <?= $f['tem_email']?'checked':'' ?>><span>Tem e-mail</span></label>
-    <label class="chk"><input type="checkbox" name="tem_tel"   value="1" <?= $f['tem_tel']?'checked':'' ?>><span>Tem telefone</span></label>
-    <label class="chk"><input type="checkbox" name="simples"   value="1" <?= $f['simples']?'checked':'' ?>><span>Simples Nacional</span></label>
-    <label class="chk"><input type="checkbox" name="mei"       value="1" <?= $f['mei']?'checked':'' ?>><span>MEI</span></label>
-
-    <div class="sep"></div>
-    <button type="submit" class="btn-search">Buscar Empresas</button>
+    <div class="filter-group">
+      <label style="display:flex;align-items:center;gap:6px">
+        <input type="checkbox" name="tem_email" value="1" <?= !empty($f['tem_email']) ? 'checked' : '' ?>>
+        Com e-mail
+      </label>
+      <label style="display:flex;align-items:center;gap:6px;margin-top:6px">
+        <input type="checkbox" name="tem_tel" value="1" <?= !empty($f['tem_tel']) ? 'checked' : '' ?>>
+        Com telefone
+      </label>
+      <label style="display:flex;align-items:center;gap:6px;margin-top:6px">
+        <input type="checkbox" name="simples" value="1" <?= !empty($f['simples']) ? 'checked' : '' ?>>
+        Simples Nacional
+      </label>
+      <label style="display:flex;align-items:center;gap:6px;margin-top:6px">
+        <input type="checkbox" name="mei" value="1" <?= !empty($f['mei']) ? 'checked' : '' ?>>
+        MEI
+      </label>
+    </div>
+    <button type="submit" class="btn-primary">Buscar</button>
   </aside>
 
-  <!-- RESULTADOS -->
-  <div class="results-box">
-    <?php if ($error): ?>
-      <div class="panel" style="border-color:#fca5a5;background:#fef2f2;">
-        <strong style="color:#b91c1c;">Erro de conexão</strong>
-        <p style="font-size:.8rem;color:#991b1b;margin-top:.4rem;"><?= e($error) ?></p>
+  <!-- Results -->
+  <main class="cnpj-results">
+    <?php if (empty($f)): ?>
+      <div class="empty-state">
+        <svg width="48" height="48" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+        <p>Use os filtros ao lado para buscar empresas na base da Receita Federal.</p>
       </div>
-
-    <?php elseif (!$searched): ?>
-      <div class="panel empty-box">
-        <div style="font-size:3rem;margin-bottom:1rem;">🏢</div>
-        <h2 style="font-size:1.1rem;font-weight:800;margin-bottom:.5rem;">Newton CNPJ</h2>
-        <p style="color:var(--ink-3);font-size:.85rem;line-height:1.65;">
-          Prospecte qualquer empresa da base completa da Receita Federal.<br>
-          Use os filtros ao lado e clique em <strong>Buscar Empresas</strong>.
-        </p>
-        <div style="margin-top:1.5rem;display:flex;gap:1rem;justify-content:center;flex-wrap:wrap;font-size:.78rem;color:var(--ink-3);">
-          <span>📍 Filtro por cidade/estado</span>
-          <span>🏭 Filtro por CNAE</span>
-          <span>📧 Filtro por e-mail/telefone</span>
-          <span>⬇ Exportação CSV</span>
-        </div>
-      </div>
-
-    <?php else:
-      $total = $results['total'] ?? 0;
-      $rows  = $results['rows']  ?? [];
-
-      $export_qs = http_build_query(array_filter([
-        'q'           => $f['q'],
-        'situacao'    => $f['situacao'] !== 'all' ? $f['situacao'] : '',
-        'uf'          => $f['uf'],
-        'municipio'   => $f['municipio'],
-        'cnae'        => $f['cnae'],
-        'porte'       => $f['porte'],
-        'mf'          => $f['mf'],
-        'simples'     => $f['simples']   ? '1' : '',
-        'mei'         => $f['mei']       ? '1' : '',
-        'tem_email'   => $f['tem_email'] ? '1' : '',
-        'tem_tel'     => $f['tem_tel']   ? '1' : '',
-        'abertura_de' => $f['abertura_de'],
-        'abertura_ate'=> $f['abertura_ate'],
-      ])); ?>
-
-      <div class="top-bar">
-        <span class="count">
-          <?php if ($total === 0): ?>
-            Nenhuma empresa encontrada
-          <?php else: ?>
-            <strong><?= number_format($total, 0, ',', '.') ?></strong> empresa<?= $total !== 1 ? 's' : '' ?> — página <?= $page ?>
+    <?php else: ?>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+        <strong><?= number_format($results['total']) ?> empresa(s) encontrada(s)</strong>
+        <div style="display:flex;gap:8px">
+          <?php if ($results['total'] > 0): ?>
+          <button type="button" onclick="openSaveModal()" style="background:#f3f4f6;color:#374151;border:none;border-radius:8px;padding:8px 14px;cursor:pointer;font-size:.85rem">
+            Salvar lista
+          </button>
+          <a href="cnpj-export.php?<?= http_build_query($f) ?>" class="export-btn">
+            Exportar CSV &nbsp;<small>(<?= number_format(min($q_limit - $q_used, 5000)) ?> disponíveis)</small>
+          </a>
           <?php endif; ?>
-        </span>
-        <?php if ($rows && $quota_remaining > 0): ?>
-          <a href="cnpj-export.php?<?= $export_qs ?>" class="btn-action" target="_blank" style="font-size:.78rem;padding:.5rem 1rem;">⬇ CSV (<?= number_format(min(5000, $quota_remaining), 0, ',', '.') ?> leads)</a>
-          <button type="button" class="btn-action secondary" onclick="showModal()" style="font-size:.78rem;padding:.5rem 1rem;">📋 Salvar Lista</button>
-        <?php elseif ($rows && $quota_remaining <= 0): ?>
-          <span style="font-size:.78rem;color:#b91c1c;font-weight:700;">⚠ Limite mensal atingido</span>
-        <?php endif; ?>
+        </div>
       </div>
 
-      <?php if ($rows): ?>
-        <div class="panel" style="padding:0;overflow:hidden;">
-          <table class="tbl">
-            <thead>
-              <tr>
-                <th>CNPJ</th>
-                <th>Razão Social</th>
-                <th>Fantasia</th>
-                <th>Setor (CNAE)</th>
-                <th>UF</th>
-                <th>Município</th>
-                <th>Telefone</th>
-                <th>E-mail</th>
-                <th>Sit.</th>
-              </tr>
-            </thead>
-            <tbody>
-              <?php foreach ($rows as $r): ?>
-                <tr>
-                  <td class="cnpj-num"><?= cnpj_fmt($r['cnpj']) ?></td>
-                  <td class="tc" title="<?= e($r['razao_social']) ?>"><?= e($r['razao_social']) ?></td>
-                  <td class="tc" title="<?= e($r['nome_fantasia']) ?>"><?= e($r['nome_fantasia'] ?: '—') ?></td>
-                  <td class="tc" title="<?= e($r['cnae_desc']) ?>" style="max-width:140px;"><?= e($r['cnae_desc'] ?: $r['cnae_principal']) ?></td>
-                  <td style="font-weight:700;"><?= e($r['uf']) ?></td>
-                  <td class="tc"><?= e($r['municipio']) ?></td>
-                  <td style="white-space:nowrap;font-size:.75rem;"><?= e($r['telefone'] ?: '—') ?></td>
-                  <td class="tc" style="max-width:160px;"><?= $r['email'] ? '<a href="mailto:'.e($r['email']).'" style="color:var(--cr);font-size:.75rem;">'.e($r['email']).'</a>' : '—' ?></td>
-                  <td>
-                    <?php $s = $r['situacao_cadastral']; ?>
-                    <span class="badge <?= $s==='02'?'b-ativa':($s==='08'?'b-baixada':'b-outros') ?>">
-                      <?= cnpj_situacao_label($s) ?>
-                    </span>
-                  </td>
-                </tr>
-              <?php endforeach; ?>
-            </tbody>
-          </table>
-        </div>
+      <div class="results-card">
+        <?php if (empty($results['rows'])): ?>
+          <div class="empty-state">Nenhuma empresa encontrada com esses filtros.</div>
+        <?php else: ?>
+        <table class="results-table">
+          <thead>
+            <tr>
+              <th>CNPJ</th>
+              <th>Razão Social / Fantasia</th>
+              <th>CNAE</th>
+              <th>UF / Município</th>
+              <th>Contato</th>
+              <th>Situação</th>
+            </tr>
+          </thead>
+          <tbody>
+            <?php foreach ($results['rows'] as $r): ?>
+            <tr>
+              <td style="font-family:monospace"><?= cnpj_fmt($r['cnpj']) ?></td>
+              <td>
+                <strong><?= e($r['razao_social']) ?></strong>
+                <?php if ($r['nome_fantasia']): ?><br><small><?= e($r['nome_fantasia']) ?></small><?php endif; ?>
+              </td>
+              <td><?= e($r['cnae_fiscal_principal']) ?></td>
+              <td><?= e($r['uf']) ?> / <?= e($r['municipio']) ?></td>
+              <td>
+                <?php if ($r['telefone1']): ?>
+                  <?= e(($r['ddd1'] ? '(' . $r['ddd1'] . ') ' : '') . $r['telefone1']) ?><br>
+                <?php endif; ?>
+                <?php if ($r['correio_eletronico']): ?>
+                  <small><?= e($r['correio_eletronico']) ?></small>
+                <?php endif; ?>
+              </td>
+              <td>
+                <?php
+                  $sit = $r['situacao_cadastral'];
+                  $cls = $sit === '02' ? 'badge-green' : ($sit === '08' ? 'badge-red' : 'badge-gray');
+                ?>
+                <span class="badge <?= $cls ?>"><?= cnpj_situacao_label($sit) ?></span>
+              </td>
+            </tr>
+            <?php endforeach; ?>
+          </tbody>
+        </table>
 
-        <?php if ($total > $per):
-          $max_pages = min((int) ceil($total / $per), 200);
-          $start     = max(1, $page - 4);
-          $end       = min($max_pages, $page + 4);
-        ?>
-          <div class="pager">
-            <?php if ($page > 1): ?>
-              <a href="<?= build_qs(['page' => $page - 1]) ?>" class="pbtn">‹</a>
+        <!-- Pagination -->
+        <?php if ($total_pages > 1): ?>
+        <div class="pagination">
+          <?php if ($page > 1): ?>
+            <a href="?<?= http_build_query(array_merge($f, ['page' => $page - 1])) ?>">‹ Anterior</a>
+          <?php endif; ?>
+          <?php
+            $start = max(1, $page - 3);
+            $end   = min($total_pages, $page + 3);
+            for ($i = $start; $i <= $end; $i++):
+          ?>
+            <?php if ($i === $page): ?>
+              <span class="current"><?= $i ?></span>
+            <?php else: ?>
+              <a href="?<?= http_build_query(array_merge($f, ['page' => $i])) ?>"><?= $i ?></a>
             <?php endif; ?>
-            <?php for ($p = $start; $p <= $end; $p++): ?>
-              <a href="<?= build_qs(['page' => $p]) ?>" class="pbtn <?= $p===$page?'cur':'' ?>"><?= $p ?></a>
-            <?php endfor; ?>
-            <?php if ($page < $max_pages): ?>
-              <a href="<?= build_qs(['page' => $page + 1]) ?>" class="pbtn">›</a>
-            <?php endif; ?>
-          </div>
+          <?php endfor; ?>
+          <?php if ($page < $total_pages): ?>
+            <a href="?<?= http_build_query(array_merge($f, ['page' => $page + 1])) ?>">Próxima ›</a>
+          <?php endif; ?>
+        </div>
         <?php endif; ?>
-
-      <?php else: ?>
-        <div class="panel empty-box">
-          <div style="font-size:2rem;margin-bottom:.75rem;">🔍</div>
-          <p style="font-weight:700;">Nenhuma empresa encontrada</p>
-          <p style="font-size:.82rem;margin-top:.4rem;color:var(--ink-3);">Tente ampliar os filtros ou buscar por outro termo.</p>
-        </div>
-      <?php endif; ?>
+        <?php endif; ?>
+      </div>
     <?php endif; ?>
-  </div>
+  </main>
 </div>
 </form>
 
-<!-- Modal salvar lista -->
-<div class="modal-bg" id="modal">
-  <div class="modal-box">
-    <h3 style="margin-bottom:1rem;">Salvar Pesquisa como Lista</h3>
+<!-- Save list modal -->
+<div class="modal-bg" id="save-modal">
+  <div class="modal">
+    <h3>Salvar lista de empresas</h3>
     <form method="post" action="cnpj-lists.php">
+      <?= csrf_field() ?>
       <input type="hidden" name="action" value="save_filter">
-      <input type="hidden" name="filter_json" id="fjson">
-      <div style="margin-bottom:.85rem;">
-        <label style="display:block;font-size:.78rem;font-weight:700;margin-bottom:.35rem;">Nome da lista</label>
-        <input type="text" name="name" required placeholder="Ex: Restaurantes SP 2026"
-          style="width:100%;padding:.6rem .8rem;border:1px solid var(--border);border-radius:8px;font-family:inherit;font-size:.85rem;">
-      </div>
-      <div style="margin-bottom:1.25rem;">
-        <label style="display:block;font-size:.78rem;font-weight:700;margin-bottom:.35rem;">Descrição (opcional)</label>
-        <textarea name="description" rows="2" style="width:100%;padding:.6rem .8rem;border:1px solid var(--border);border-radius:8px;font-family:inherit;font-size:.85rem;resize:vertical;"></textarea>
-      </div>
-      <div style="display:flex;gap:.75rem;">
-        <button type="button" class="btn-action secondary" onclick="closeModal()" style="flex:1;">Cancelar</button>
-        <button type="submit" class="btn-action" style="flex:1;">Salvar</button>
+      <input type="hidden" name="filter_json" value="<?= e(json_encode($f)) ?>">
+      <input type="hidden" name="item_count" value="<?= $results['total'] ?>">
+      <input type="text" name="name" placeholder="Nome da lista" required>
+      <textarea name="description" placeholder="Descrição (opcional)" rows="3"></textarea>
+      <div class="modal-actions">
+        <button type="button" class="btn-cancel" onclick="closeModal()">Cancelar</button>
+        <button type="submit" class="btn-primary" style="width:auto">Salvar</button>
       </div>
     </form>
   </div>
 </div>
 
 <script>
-function loadMunicipios(uf) {
-  const sel = document.getElementById('sel-mun');
-  sel.innerHTML = '<option value="">Carregando...</option>';
-  if (!uf) { sel.innerHTML = '<option value="">Todos</option>'; return; }
-  fetch('cnpj-api.php?action=municipios&uf=' + uf)
-    .then(r => r.json())
-    .then(data => {
-      sel.innerHTML = '<option value="">Todos</option>';
-      data.forEach(m => {
-        const o = document.createElement('option');
-        o.value = m.codigo; o.textContent = m.nome; sel.appendChild(o);
-      });
-    })
-    .catch(() => { sel.innerHTML = '<option value="">Erro ao carregar</option>'; });
-}
+function openSaveModal() { document.getElementById('save-modal').classList.add('open'); }
+function closeModal()     { document.getElementById('save-modal').classList.remove('open'); }
 
-(function() {
-  const uf  = document.getElementById('sel-uf').value;
-  const mun = '<?= e($f['municipio']) ?>';
-  if (!uf) return;
-  fetch('cnpj-api.php?action=municipios&uf=' + uf)
-    .then(r => r.json())
-    .then(data => {
-      const sel = document.getElementById('sel-mun');
-      sel.innerHTML = '<option value="">Todos</option>';
-      data.forEach(m => {
+async function loadMunicipios() {
+    const uf  = document.getElementById('uf-sel').value;
+    const sel = document.getElementById('mun-sel');
+    sel.innerHTML = '<option value="">Todos</option>';
+    if (!uf) return;
+    const data = await fetch('cnpj-api.php?action=municipios&uf=' + uf).then(r => r.json());
+    data.forEach(m => {
         const o = document.createElement('option');
         o.value = m.codigo; o.textContent = m.nome;
-        if (m.codigo === mun) o.selected = true;
         sel.appendChild(o);
-      });
     });
-})();
+}
 
-function showModal() {
-  const fd = new FormData(document.getElementById('frm'));
-  const obj = {};
-  for (const [k, v] of fd.entries()) obj[k] = v;
-  document.getElementById('fjson').value = JSON.stringify(obj);
-  document.getElementById('modal').style.display = 'flex';
-}
-function closeModal() {
-  document.getElementById('modal').style.display = 'none';
-}
-document.getElementById('modal').addEventListener('click', e => {
-  if (e.target === document.getElementById('modal')) closeModal();
-});
+// Reload municipios if UF already selected
+if (document.getElementById('uf-sel').value) loadMunicipios();
 </script>
+</body>
+</html>
 <?php
 });

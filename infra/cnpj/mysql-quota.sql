@@ -1,23 +1,60 @@
--- Newton CNPJ — Quota mensal de downloads
--- Executar no banco principal da Newtonia
+-- ============================================================
+-- NEWTON AI — CNPJ Download Limits  (quota v2)
+-- Run once against the MySQL app database
+-- ============================================================
 
--- 1. Campo nas tabelas de planos e tenants
-ALTER TABLE plans
-    ADD COLUMN IF NOT EXISTS limit_cnpj_monthly INT NOT NULL DEFAULT 1000
-    COMMENT 'Máximo de leads CNPJ exportados por mês';
+-- 1. Planos de CNPJ -------------------------------------------------------
+CREATE TABLE IF NOT EXISTS cnpj_plans (
+    id            INT UNSIGNED   AUTO_INCREMENT PRIMARY KEY,
+    name          VARCHAR(50)    NOT NULL,
+    monthly_limit INT UNSIGNED   NOT NULL COMMENT 'Leads incluídos por mês',
+    price_monthly DECIMAL(10,2)  NOT NULL,
+    active        TINYINT(1)     NOT NULL DEFAULT 1,
+    created_at    TIMESTAMP      NOT NULL DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+INSERT IGNORE INTO cnpj_plans (name, monthly_limit, price_monthly) VALUES
+    ('Starter',      100,  49.90),
+    ('Basic',        200,  89.90),
+    ('Professional', 300, 129.90),
+    ('Business',     500, 199.90);
+
+-- 2. Pacotes de créditos avulsos ------------------------------------------
+CREATE TABLE IF NOT EXISTS cnpj_addon_packs (
+    id         INT UNSIGNED   AUTO_INCREMENT PRIMARY KEY,
+    quantity   INT UNSIGNED   NOT NULL COMMENT 'Leads do pacote',
+    price      DECIMAL(10,2)  NOT NULL,
+    active     TINYINT(1)     NOT NULL DEFAULT 1,
+    created_at TIMESTAMP      NOT NULL DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+INSERT IGNORE INTO cnpj_addon_packs (quantity, price) VALUES
+    (100,   19.90),
+    (1000, 149.90);
+
+-- 3. Colunas no tenant -----------------------------------------------------
 ALTER TABLE tenants
-    ADD COLUMN IF NOT EXISTS limit_cnpj_monthly INT NOT NULL DEFAULT 1000
-    COMMENT 'Máximo de leads CNPJ exportados por mês (pode sobrescrever o plano)';
+    ADD COLUMN IF NOT EXISTS cnpj_plan_id        INT UNSIGNED  DEFAULT NULL  COMMENT 'FK cnpj_plans.id',
+    ADD COLUMN IF NOT EXISTS cnpj_limit_override  INT UNSIGNED  DEFAULT NULL  COMMENT 'NULL = usa limite do plano',
+    ADD COLUMN IF NOT EXISTS cnpj_addon_credits   INT UNSIGNED  NOT NULL DEFAULT 0 COMMENT 'Créditos avulsos acumulados';
 
--- 2. Log de downloads por tenant/mês
+-- 4. Log de downloads (uma linha por evento) --------------------------------
 CREATE TABLE IF NOT EXISTS cnpj_download_log (
-    id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-    tenant_id   INT UNSIGNED    NOT NULL,
-    year_month  CHAR(7)         NOT NULL COMMENT 'YYYY-MM',
-    rows_count  INT UNSIGNED    NOT NULL DEFAULT 0,
-    updated_at  DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    PRIMARY KEY (id),
-    UNIQUE KEY uk_tenant_month (tenant_id, year_month),
+    id            BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    tenant_id     INT UNSIGNED    NOT NULL,
+    downloaded_at TIMESTAMP       NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    records_count INT UNSIGNED    NOT NULL DEFAULT 0,
+    filters_json  TEXT            DEFAULT NULL,
+    INDEX idx_tenant_month (tenant_id, downloaded_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- 5. Histórico de compras de addons ----------------------------------------
+CREATE TABLE IF NOT EXISTS cnpj_addon_purchases (
+    id           INT UNSIGNED   AUTO_INCREMENT PRIMARY KEY,
+    tenant_id    INT UNSIGNED   NOT NULL,
+    pack_id      INT UNSIGNED   NOT NULL,
+    quantity     INT UNSIGNED   NOT NULL,
+    price_paid   DECIMAL(10,2)  NOT NULL,
+    purchased_at TIMESTAMP      NOT NULL DEFAULT CURRENT_TIMESTAMP,
     INDEX idx_tenant (tenant_id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
