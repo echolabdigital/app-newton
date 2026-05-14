@@ -10,9 +10,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $data = [
             'name'        => trim($_POST['name'] ?? ''),
             'price_cents' => (int) round(((float) str_replace(',', '.', $_POST['price'] ?? 0)) * 100),
-            'limit_dispatch_daily'    => (int) ($_POST['limit_dispatch_daily'] ?? 0),
-            'limit_contacts'          => (int) ($_POST['limit_contacts'] ?? 0),
+            'limit_dispatch_daily'    => (int) ($_POST['limit_dispatch_daily']    ?? 0),
+            'limit_contacts'          => (int) ($_POST['limit_contacts']          ?? 0),
             'limit_extractor_monthly' => (int) ($_POST['limit_extractor_monthly'] ?? 0),
+            'limit_cnpj_monthly'      => (int) ($_POST['limit_cnpj_monthly']      ?? 0),
             'active'                  => isset($_POST['active']) ? 1 : 0,
         ];
         if ($pid) {
@@ -20,7 +21,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             audit_log('plan.updated', 'plan', $pid);
             flash_set('success', 'Plano atualizado.');
         } else {
-            $data['code'] = slugify($data['name']);
+            $data['code']     = slugify($data['name']);
             $data['features'] = json_encode([]);
             db_insert('plans', $data);
             flash_set('success', 'Plano criado.');
@@ -42,16 +43,26 @@ admin_layout('Planos', 'plans', function() use ($plans) {
   </p>
   <table>
     <thead>
-      <tr><th>Plano</th><th>Preço/mês</th><th>Disparos/dia</th><th>Contatos</th><th>Extrações/mês</th><th>Ativo</th><th></th></tr>
+      <tr>
+        <th>Plano</th>
+        <th>Preço/mês</th>
+        <th>Disparos/dia</th>
+        <th>Contatos</th>
+        <th>Extrações/mês</th>
+        <th>CNPJ/mês</th>
+        <th>Ativo</th>
+        <th></th>
+      </tr>
     </thead>
     <tbody>
     <?php foreach ($plans as $p): ?>
       <tr>
         <td><strong><?= e($p['name']) ?></strong> <span style="font-size:.7rem;color:var(--ink-3);font-family:monospace;">[<?= e($p['code']) ?>]</span></td>
         <td><?= brl_cents((int)$p['price_cents']) ?></td>
-        <td><?= number_format((int)$p['limit_dispatch_daily'], 0, ',', '.') ?></td>
-        <td><?= number_format((int)$p['limit_contacts'], 0, ',', '.') ?></td>
+        <td><?= number_format((int)$p['limit_dispatch_daily'],    0, ',', '.') ?></td>
+        <td><?= number_format((int)$p['limit_contacts'],          0, ',', '.') ?></td>
         <td><?= number_format((int)$p['limit_extractor_monthly'], 0, ',', '.') ?></td>
+        <td><?= number_format((int)$p['limit_cnpj_monthly'],      0, ',', '.') ?></td>
         <td><?= $p['active'] ? '<span class="badge badge-active">sim</span>' : '<span class="badge badge-cancelled">não</span>' ?></td>
         <td>
           <button type="button" class="btn-action secondary" style="font-size:.7rem;padding:.4rem .8rem;" onclick="editPlan(<?= htmlspecialchars(json_encode($p), ENT_QUOTES) ?>)">Editar</button>
@@ -74,11 +85,18 @@ admin_layout('Planos', 'plans', function() use ($plans) {
     <div class="row-3">
       <div class="field"><label>Disparos/dia</label><input type="number" name="limit_dispatch_daily" id="f-dispatch" min="0"></div>
       <div class="field"><label>Limite contatos</label><input type="number" name="limit_contacts" id="f-contacts" min="0"></div>
-      <div class="field"><label>Extrações/mês</label><input type="number" name="limit_extractor_monthly" id="f-extractor" min="0"></div>
+      <div class="field"><label>Extrações/mês (Maps)</label><input type="number" name="limit_extractor_monthly" id="f-extractor" min="0"></div>
     </div>
-    <div class="field" style="display:flex;align-items:center;gap:.5rem;">
-      <input type="checkbox" name="active" id="f-active" style="width:auto;" checked>
-      <label for="f-active" style="margin:0;">Ativo (visível pra novos tenants)</label>
+    <div class="row-2">
+      <div class="field">
+        <label>Leads CNPJ/mês</label>
+        <input type="number" name="limit_cnpj_monthly" id="f-cnpj" min="0" placeholder="Ex: 5000">
+        <small style="font-size:.7rem;color:var(--ink-3);">Máx. de leads exportados por mês via Newton CNPJ</small>
+      </div>
+      <div class="field" style="display:flex;align-items:center;gap:.5rem;padding-top:1.5rem;">
+        <input type="checkbox" name="active" id="f-active" style="width:auto;" checked>
+        <label for="f-active" style="margin:0;">Ativo (visível pra novos tenants)</label>
+      </div>
     </div>
     <div style="display:flex;gap:1rem;justify-content:flex-end;">
       <button type="button" class="btn-action secondary" onclick="resetForm()">Limpar</button>
@@ -89,15 +107,16 @@ admin_layout('Planos', 'plans', function() use ($plans) {
 
 <script>
 function editPlan(p) {
-  document.getElementById('plan_id').value = p.id;
-  document.getElementById('f-name').value = p.name;
-  document.getElementById('f-price').value = (p.price_cents / 100).toFixed(2).replace('.', ',');
+  document.getElementById('plan_id').value    = p.id;
+  document.getElementById('f-name').value     = p.name;
+  document.getElementById('f-price').value    = (p.price_cents / 100).toFixed(2).replace('.', ',');
   document.getElementById('f-dispatch').value = p.limit_dispatch_daily;
   document.getElementById('f-contacts').value = p.limit_contacts;
-  document.getElementById('f-extractor').value = p.limit_extractor_monthly;
+  document.getElementById('f-extractor').value= p.limit_extractor_monthly;
+  document.getElementById('f-cnpj').value     = p.limit_cnpj_monthly;
   document.getElementById('f-active').checked = p.active == 1;
-  document.getElementById('edit-title').innerText = 'Editando: ' + p.name;
-  document.getElementById('submit-btn').innerText = 'Salvar alterações';
+  document.getElementById('edit-title').innerText  = 'Editando: ' + p.name;
+  document.getElementById('submit-btn').innerText  = 'Salvar alterações';
   document.getElementById('edit-form').scrollIntoView({behavior:'smooth'});
 }
 function resetForm() {
