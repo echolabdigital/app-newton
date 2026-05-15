@@ -3,9 +3,10 @@
  * Newton AI — Newton CNPJ: busca e prospecção de empresas
  */
 
-require_once __DIR__ . '/../core/auth.php';
-require_once __DIR__ . '/../core/db.php';
-require_once __DIR__ . '/../core/cnpj_db.php';
+require_once __DIR__ . '/../config.php';
+require_once __DIR__ . '/_layout.php';
+$tenant    = require_tenant();
+$tenant_id = (int) $tenant['id'];
 
 $f = array_map('trim', array_filter($_GET, 'is_string'));
 

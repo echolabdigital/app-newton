@@ -82,7 +82,7 @@ function cnpj_build_where(array $f): array
     }
 
     if (!empty($f['cnae'])) {
-        $conds[]  = 'e.cnae_fiscal_principal = ?';
+        $conds[]  = 'e.cnae_principal = ?';
         $params[] = $f['cnae'];
     }
 
@@ -92,7 +92,7 @@ function cnpj_build_where(array $f): array
     }
 
     if (!empty($f['mf'])) {
-        $conds[]  = 'e.matriz_filial = ?';
+        $conds[]  = 'e.identificador_mf = ?';
         $params[] = $f['mf'];
     }
 
@@ -107,7 +107,7 @@ function cnpj_build_where(array $f): array
     }
 
     if (!empty($f['tem_email'])) {
-        $conds[] = "e.correio_eletronico IS NOT NULL AND e.correio_eletronico <> ''";
+        $conds[] = "e.email IS NOT NULL AND e.email <> ''";
     }
 
     if (!empty($f['tem_tel'])) {
@@ -134,7 +134,7 @@ function cnpj_search(array $f, int $page = 1, int $per = 20): array
 
     $total = (int) cnpj_val(
         "SELECT COUNT(*) FROM rf_estabelecimentos e
-         JOIN rf_empresas emp ON emp.cnpj_basico = e.cnpj_basico $where",
+         LEFT JOIN rf_empresas emp ON emp.cnpj_basico = e.cnpj_basico $where",
         $params
     );
 
@@ -142,24 +142,24 @@ function cnpj_search(array $f, int $page = 1, int $per = 20): array
     $rows   = cnpj_all(
         "SELECT
             e.cnpj_basico || e.cnpj_ordem || e.cnpj_dv AS cnpj,
-            emp.razao_social,
+            COALESCE(emp.razao_social, e.nome_fantasia, 'N/D') AS razao_social,
             e.nome_fantasia,
             e.situacao_cadastral,
             e.data_inicio_atividade,
-            e.cnae_fiscal_principal,
+            e.cnae_principal,
             e.uf,
             e.municipio,
             e.ddd1,
             e.telefone1,
             e.ddd2,
             e.telefone2,
-            e.correio_eletronico,
-            emp.porte_empresa,
-            e.matriz_filial
+            e.email,
+            COALESCE(emp.porte_empresa, '00') AS porte_empresa,
+            e.identificador_mf
          FROM rf_estabelecimentos e
-         JOIN rf_empresas emp ON emp.cnpj_basico = e.cnpj_basico
+         LEFT JOIN rf_empresas emp ON emp.cnpj_basico = e.cnpj_basico
          $where
-         ORDER BY emp.razao_social
+         ORDER BY razao_social
          LIMIT $per OFFSET $offset",
         $params
     );
