@@ -147,8 +147,10 @@ function cnpj_search(array $f, int $page = 1, int $per = 20): array
             e.situacao_cadastral,
             e.data_inicio_atividade,
             e.cnae_principal,
+            COALESCE(cn.descricao, e.cnae_principal) AS cnae_descricao,
             e.uf,
             e.municipio,
+            COALESCE(mun.descricao, e.municipio::text) AS municipio_nome,
             e.ddd1,
             e.telefone1,
             e.ddd2,
@@ -157,7 +159,9 @@ function cnpj_search(array $f, int $page = 1, int $per = 20): array
             COALESCE(emp.porte_empresa, '00') AS porte_empresa,
             e.identificador_mf
          FROM rf_estabelecimentos e
-         LEFT JOIN rf_empresas emp ON emp.cnpj_basico = e.cnpj_basico
+         LEFT JOIN rf_empresas  emp ON emp.cnpj_basico = e.cnpj_basico
+         LEFT JOIN rf_municipios mun ON mun.codigo::text = e.municipio::text
+         LEFT JOIN rf_cnaes      cn  ON cn.codigo        = e.cnae_principal
          $where
          ORDER BY razao_social
          LIMIT $per OFFSET $offset",

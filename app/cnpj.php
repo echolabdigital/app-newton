@@ -76,6 +76,12 @@ app_layout('Newton CNPJ', 'cnpj', function () use ($f, $results, $page, $total_p
   .modal input, .modal textarea { width:100%; box-sizing:border-box; padding:8px 12px; border:1px solid #e5e7eb; border-radius:8px; font-size:.9rem; margin-bottom:10px; }
   .modal-actions    { display:flex; gap:10px; justify-content:flex-end; margin-top:6px; }
   .btn-cancel       { background:#f3f4f6; color:#374151; border:none; border-radius:8px; padding:8px 16px; cursor:pointer; }
+  /* CNAE autocomplete */
+  #cnae-suggestions { position:absolute; top:2px; left:0; right:0; background:#fff; border:1px solid #e5e7eb;
+                       border-radius:8px; box-shadow:0 4px 16px rgba(0,0,0,.1); z-index:50; max-height:220px; overflow-y:auto; }
+  #cnae-suggestions div { padding:8px 12px; cursor:pointer; font-size:.82rem; border-bottom:1px solid #f3f4f6; }
+  #cnae-suggestions div:hover { background:#f0f4ff; }
+  #cnae-suggestions div small { color:#6b7280; display:block; }
 </style>
 </head>
 <body>
@@ -134,7 +140,9 @@ app_layout('Newton CNPJ', 'cnpj', function () use ($f, $results, $page, $total_p
     </div>
     <div class="filter-group">
       <label>CNAE principal</label>
-      <input type="text" name="cnae" value="<?= e($f['cnae'] ?? '') ?>" placeholder="Ex: 6201500">
+      <input type="text" id="cnae-input" name="cnae" value="<?= e($f['cnae'] ?? '') ?>"
+             placeholder="Digite atividade ou código…" autocomplete="off">
+      <div id="cnae-list" style="position:relative"></div>
     </div>
     <div class="filter-group">
       <label>Porte</label>
@@ -227,14 +235,14 @@ app_layout('Newton CNPJ', 'cnpj', function () use ($f, $results, $page, $total_p
                 <strong><?= e($r['razao_social']) ?></strong>
                 <?php if ($r['nome_fantasia']): ?><br><small><?= e($r['nome_fantasia']) ?></small><?php endif; ?>
               </td>
-              <td><?= e($r['cnae_fiscal_principal']) ?></td>
-              <td><?= e($r['uf']) ?> / <?= e($r['municipio']) ?></td>
+              <td title="<?= e($r['cnae_principal'] ?? '') ?>"><?= e(mb_strimwidth($r['cnae_descricao'] ?? $r['cnae_principal'] ?? '', 0, 40, '…')) ?></td>
+              <td><?= e($r['uf']) ?> / <?= e($r['municipio_nome'] ?? $r['municipio']) ?></td>
               <td>
                 <?php if ($r['telefone1']): ?>
                   <?= e(($r['ddd1'] ? '(' . $r['ddd1'] . ') ' : '') . $r['telefone1']) ?><br>
                 <?php endif; ?>
-                <?php if ($r['correio_eletronico']): ?>
-                  <small><?= e($r['correio_eletronico']) ?></small>
+                <?php if ($r['email']): ?>
+                  <small><?= e($r['email']) ?></small>
                 <?php endif; ?>
               </td>
               <td>
@@ -301,21 +309,81 @@ app_layout('Newton CNPJ', 'cnpj', function () use ($f, $results, $page, $total_p
 function openSaveModal() { document.getElementById('save-modal').classList.add('open'); }
 function closeModal()     { document.getElementById('save-modal').classList.remove('open'); }
 
-async function loadMunicipios() {
+// ── Municipality autocomplete ──────────────────────────────────────────────────
+async function loadMunicipios(keepValue) {
     const uf  = document.getElementById('uf-sel').value;
     const sel = document.getElementById('mun-sel');
     sel.innerHTML = '<option value="">Todos</option>';
     if (!uf) return;
-    const data = await fetch('cnpj-api.php?action=municipios&uf=' + uf).then(r => r.json());
-    data.forEach(m => {
-        const o = document.createElement('option');
-        o.value = m.codigo; o.textContent = m.nome;
-        sel.appendChild(o);
-    });
+    try {
+        const data = await fetch('cnpj-api.php?action=municipios&uf=' + uf).then(r => r.json());
+        data.forEach(m => {
+            const o = document.createElement('option');
+            o.value = m.codigo;
+            o.textContent = m.nome;
+            if (keepValue && m.codigo == keepValue) o.selected = true;
+            sel.appendChild(o);
+        });
+    } catch(e) { /* silently ignore */ }
 }
 
-// Reload municipios if UF already selected
-if (document.getElementById('uf-sel').value) loadMunicipios();
+// On page load: if UF already set, reload municipios and keep current selection
+(function(){
+    const uf  = document.getElementById('uf-sel').value;
+    const mun = '<?= addslashes($f['municipio'] ?? '') ?>';
+    if (uf) loadMunicipios(mun);
+})();
+
+// ── CNAE autocomplete ──────────────────────────────────────────────────────────
+(function(){
+    const inp = document.getElementById('cnae-input');
+    const box = document.getElementById('cnae-list');
+    let timer;
+
+    inp.addEventListener('input', function() {
+        clearTimeout(timer);
+        const q = inp.value.trim();
+        if (q.length < 2) { hideSugg(); return; }
+        timer = setTimeout(() => fetchCnaes(q), 280);
+    });
+
+    inp.addEventListener('keydown', function(e) {
+        if (e.key === 'Escape') hideSugg();
+    });
+
+    document.addEventListener('click', function(e) {
+        if (!box.contains(e.target) && e.target !== inp) hideSugg();
+    });
+
+    async function fetchCnaes(q) {
+        try {
+            const data = await fetch('cnpj-api.php?action=cnaes&q=' + encodeURIComponent(q)).then(r => r.json());
+            if (!data.length) { hideSugg(); return; }
+            let el = document.getElementById('cnae-suggestions');
+            if (!el) {
+                el = document.createElement('div');
+                el.id = 'cnae-suggestions';
+                box.appendChild(el);
+            }
+            el.innerHTML = '';
+            data.forEach(c => {
+                const d = document.createElement('div');
+                d.innerHTML = '<strong>' + c.codigo + '</strong><small>' + c.descricao + '</small>';
+                d.addEventListener('mousedown', function(e) {
+                    e.preventDefault();
+                    inp.value = c.codigo;
+                    hideSugg();
+                });
+                el.appendChild(d);
+            });
+        } catch(e) { hideSugg(); }
+    }
+
+    function hideSugg() {
+        const el = document.getElementById('cnae-suggestions');
+        if (el) el.remove();
+    }
+})();
 </script>
 </body>
 </html>
